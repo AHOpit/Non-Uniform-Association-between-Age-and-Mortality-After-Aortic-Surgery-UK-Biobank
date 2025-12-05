@@ -1,0 +1,249 @@
+## --------------------------------------------------------------
+## UK Biobank Aortic Surgery: Clustering & Survival Analysis
+## Electronic Supplement - Reproducible R Code
+## --------------------------------------------------------------
+
+# Load packages ---------------------------------------------------------
+library(tidyverse)
+library(factoextra)
+library(survival)
+library(survminer)
+library(splines)
+library(broom)
+library(patchwork)
+
+# --------------------------------------------------------------
+# 1. DATA INPUT (PLACEHOLDER - NO RAW DATA)
+# --------------------------------------------------------------
+# data: Participant.ID, Diagnoses...ICD10, Operative.procedures...OPCS4,
+#       Year.of.birth, Sex, Ever.smoked...Instance.0, Body.mass.index..BMI....Instance.0
+# death: Participant.ID, Date.of.death
+# Replace with your processed versions
+
+# data <- read_csv("processed_participant_data.csv")
+# death <- read_csv("processed_death_records.csv")
+
+# --------------------------------------------------------------
+# 2. FEATURE ENGINEERING
+# --------------------------------------------------------------
+
+data <- data %>%
+  mutate(
+    # Binary comorbidities
+    CHD = str_detect(Diagnoses...ICD10, "I25"),
+    CTD = str_detect(Diagnoses...ICD10, "Q87.4|Q79.6"),
+    Cancer = str_detect(Diagnoses...ICD10, "Malignant"),
+    CKD = str_detect(Diagnoses...ICD10, "N18"),
+    AHT = str_detect(Diagnoses...ICD10, "I10"),
+    DYSRHYTH = str_detect(Diagnoses...ICD10, "I48|I49"),
+    HF = str_detect(Diagnoses...ICD10, "I50"),
+    Rupture = str_detect(Diagnoses...ICD10, "I71.[1358]"),
+    Endo = str_detect(Operative.procedures...OPCS4, "L26|L27|L28"),
+    OSR = str_detect(Operative.procedures...OPCS4, "L18|L19"),
+    PA = str_detect(Diagnoses...ICD10, "I72.4"),
+    Ever_Smoked = Ever.smoked...Instance.0 == "Yes",
+    # Surgery date & age
+    Surgery_Date = as.Date(Surgery_Date),  # pre-extracted
+    Year_Surgery = as.numeric(format(Surgery_Date, "%Y")),
+    Age_at_Surgery = Year_Surgery - Year.of.birth,
+    # Pathology
+    Pathology = case_when(
+      str_detect(Diagnoses...ICD10, "I71.[34]") ~ "AAA",
+      str_detect(Diagnoses...ICD10, "I71.[12]") ~ "TAA",
+      str_detect(Diagnoses...ICD10, "I71.[56]") ~ "TAAA",
+      str_detect(Diagnoses...ICD10, "I71.0") ~ "Dissection",
+      TRUE ~ "Other"
+    )
+  )
+
+# --------------------------------------------------------------
+# 3. FINAL COHORT & ONE-HOT ENCODING
+# --------------------------------------------------------------
+
+cohort <- data %>%
+  filter(!is.na(Surgery_Date)) %>%
+  select(
+    Participant.ID, Age_at_Surgery, BMI = Body.mass.index..BMI....Instance.0,
+    Sex, CHD, AHT, HF, DYSRHYTH, CKD, PA, Ever_Smoked, CTD,
+    Rupture, Endo, Pathology, Year_Surgery, Surgery_Date
+  ) %>%
+  na.omit()
+
+# One-hot encode Sex and Pathology
+cohort <- cohort %>%
+  mutate(
+    Sex = factor(Sex, levels = c("Male", "Female")),
+    Pathology = factor(Pathology)
+  )
+
+dummy <- model.matrix(~ Sex + Pathology - 1, data = cohort) %>%
+  as.data.frame()
+
+cluster_features <- cohort %>%
+  select(Age_at_Surgery, BMI, CHD, AHT, HF, DYSRHYTH, CKD, PA,
+         Ever_Smoked, CTD, Rupture, Endo) %>%
+  bind_cols(dummy) %>%
+  mutate(across(everything(), ~ as.numeric(scale(.))))  # Standardize
+
+# --------------------------------------------------------------
+# 4. K-MEANS CLUSTERING
+# --------------------------------------------------------------
+
+set.seed(123)
+k2 <- kmeans(cluster_features, centers = 2, nstart = 25)
+k3 <- kmeans(cluster_features, centers = 3, nstart = 25)
+
+cohort <- cohort %>%
+  mutate(
+    Cluster_2 = factor(k2$cluster, labels = c("Cluster 1", "Cluster 2")),
+    Cluster_3 = factor(k3$cluster, labels = c("Cluster 1", "Cluster 2", "Cluster 3"))
+  )
+
+# --------------------------------------------------------------
+# 5. MERGE WITH DEATH & CREATE OUTCOMES
+# --------------------------------------------------------------
+
+death <- death %>% mutate(Date.of.death = as.Date(Date.of.death))
+
+analysis <- cohort %>%
+  left_join(death, by = "Participant.ID") %>%
+  mutate(
+    Death_after_Surgery = as.numeric(Date.of.death - Surgery_Date),
+    Death_after_Surgery = if_else(is.na(Death_after_Surgery),
+                                  as.numeric(as.Date("2024-12-31") - Surgery_Date),
+                                  Death_after_Surgery),
+    Event = if_else(is.na(Date.of.death), 0, 1),
+    Age_at_Death = Year.of.birth + (Date.of.death %/% 365.25),
+    Age_at_Death = if_else(is.na(Age_at_Death), 2024 - Year.of.birth, Age_at_Death)
+  )
+
+# --------------------------------------------------------------
+# 6. TABLE 2 & 3: CLUSTER CHARACTERISTICS WITH 95% CI
+# --------------------------------------------------------------
+
+prop_ci <- function(x, n) {
+  res <- prop.test(x, n)
+  sprintf("%.1f%% (%.1f–%.1f)", 100*x/n, 100*res$conf.int[1], 100*res$conf.int[2])
+}
+
+make_cluster_table <- function(data, cluster_var) {
+  data %>%
+    group_by({{ cluster_var }}) %>%
+    summarise(
+      n = n(),
+      Age = mean(Age_at_Surgery),
+      BMI = mean(BMI),
+      across(c(CHD, AHT, HF, DYSRHYTH, CKD, PA, Ever_Smoked, CTD, Rupture, Endo,
+               starts_with("Sex"), starts_with("Pathology")), 
+             list(prop = ~sum(.)/n(), ci = ~prop_ci(sum(.), n()))),
+      .groups = "drop"
+    ) %>%
+    pivot_longer(-c({{ cluster_var }}, n, Age, BMI), 
+                 names_to = c("Variable", ".value"), 
+                 names_pattern = "(.*)_(prop|ci)") %>%
+    mutate(
+      Value = ifelse(Variable %in% c("Age", "BMI"), 
+                     sprintf("%.1f", prop), 
+                     paste0(sprintf("%.1f", 100*prop), "% (", ci, ")"))
+    ) %>%
+    select({{ cluster_var }}, n, Variable, Value)
+}
+
+table_2 <- make_cluster_table(analysis, Cluster_2)
+table_3 <- make_cluster_table(analysis, Cluster_3)
+
+print("=== TABLE 2 (2 Clusters) ==="); print(table_2)
+print("=== TABLE 3 (3 Clusters) ==="); print(table_3)
+
+# --------------------------------------------------------------
+# 7. KAPLAN-MEIER PLOTS (Figure 1)
+# --------------------------------------------------------------
+
+# Age at death
+km_age_2 <- survfit(Surv(Age_at_Death, Event) ~ Cluster_2, data = analysis)
+km_age_3 <- survfit(Surv(Age_at_Death, Event) ~ Cluster_3, data = analysis)
+
+# Days since surgery
+km_days_2 <- survfit(Surv(Death_after_Surgery, Event) ~ Cluster_2, data = analysis)
+km_days_3 <- survfit(Surv(Death_after_Surgery, Event) ~ Cluster_3, data = analysis)
+
+# Plot (example — adjust as needed)
+ggsurvplot(km_days_3, data = analysis, 
+           conf.int = TRUE, pval = TRUE, risk.table = TRUE,
+           xlab = "Days since Surgery", break.time.by = 730,
+           palette = c("#7ad151", "#2a788e", "#440154"))
+
+# --------------------------------------------------------------
+# 8. COX MODELS (Tables 4–6)
+# --------------------------------------------------------------
+
+# Univariate (Table 4)
+cox_univariate <- function(data, cluster_var) {
+  data %>%
+    group_by({{ cluster_var }}) %>%
+    do(model = coxph(Surv(Death_after_Surgery, Event) ~ Age_at_Surgery, data = .)) %>%
+    mutate(
+      HR = exp(coef(model)["Age_at_Surgery"]),
+      CI = exp(conf.int(model)["Age_at_Surgery",]),
+      p = summary(model)$coef["Age_at_Surgery", "Pr(>|z|)"]
+    ) %>%
+    select({{ cluster_var }}, HR, CI, p)
+}
+
+# Adjusted (Table 5)
+cox_adjusted <- function(data, cluster_var) {
+  data %>%
+    group_by({{ cluster_var }}) %>%
+    do(model = coxph(Surv(Death_after_Surgery, Event) ~ Age_at_Surgery + Year_Surgery, data = .)) %>%
+    mutate(HR = exp(coef(model)["Age_at_Surgery"]), p = summary(model)$coef["Age_at_Surgery", "Pr(>|z|)"])
+}
+
+# Final model (Table 6)
+final_models <- analysis %>%
+  group_by(Cluster_3) %>%
+  do(model = coxph(Surv(Death_after_Surgery, Event) ~ Age_at_Surgery + Year_Surgery + CKD + HF + Pathology, data = .))
+
+# --------------------------------------------------------------
+# 9. NON-LINEARITY & FIGURE 3
+# --------------------------------------------------------------
+
+plot_hr_curve <- function(data, title, y_max = 10, peri_op = FALSE) {
+  if (peri_op) {
+    data <- data %>% mutate(
+      Death_after_Surgery = pmin(Death_after_Surgery, 31),
+      Event = if_else(Death_after_Surgery == 31, 0, Event)
+    )
+  }
+  
+  model <- coxph(Surv(Death_after_Surgery, Event) ~ ns(Age_at_Surgery, df = 4), data = data)
+  age_seq <- seq(40, 85, length.out = 200)
+  pred_df <- data.frame(Age_at_Surgery = age_seq)
+  
+  pred <- predict(model, newdata = pred_df, type = "risk", se.fit = TRUE)
+  hr_df <- data.frame(
+    Age = age_seq,
+    HR = exp(pred$fit),
+    lower = exp(pred$fit - 1.96 * pred$se.fit),
+    upper = exp(pred$fit + 1.96 * pred$se.fit)
+  )
+  
+  ggplot(hr_df, aes(x = Age, y = HR)) +
+    geom_line(color = "#46039f", size = 1.2) +
+    geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.2, fill = "#46039f") +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "red") +
+    labs(title = title, x = "Age at Surgery", y = "Hazard Ratio") +
+    scale_y_continuous(limits = c(0, y_max)) +
+    theme_minimal(base_size = 14)
+}
+
+p1 <- plot_hr_curve(analysis, "All-Cause Mortality", y_max = 9)
+p2 <- plot_hr_curve(analysis %>% filter(Death_after_Surgery > 30), "Excluding 30-Day Deaths", y_max = 8)
+p3 <- plot_hr_curve(analysis, "Peri-operative (≤30 Days)", y_max = 45, peri_op = TRUE)
+
+(p1 | p2 | p3) + plot_annotation(tag_levels = "A")
+
+
+
+# --------------------------------------------------------------
+# END OF SCRIPT
+# --------------------------------------------------------------
